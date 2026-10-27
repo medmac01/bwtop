@@ -1,0 +1,636 @@
+#!/usr/bin/env python3
+"""nvbwtop: nvitop-style memory bandwidth monitor for NVIDIA GPUs and host DRAM (Linux).
+
+GPU side uses NVML (no root). NVML reports VRAM "busy %": the fraction of time device
+memory was being read or written. GB/s is estimated from it; on RTX A6000 a streaming
+copy at 100% busy measured 678 GB/s (88% of theoretical), and partial loads read ~15%
+high, so treat GPU GB/s as an approximation.
+
+Host side reads Intel uncore IMC CAS counters through perf_event_open, which is exact
+(64 bytes per CAS; within ~10% of a read benchmark) but needs root: run with sudo to get the HOST rows.
+"""
+import ctypes
+import os
+import pwd
+import re
+import select
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import termios
+import time
+import tty
+from collections import deque
+
+EFF = 0.883  # measured streaming-copy GB/s at 100% busy / theoretical peak (A6000)
+HISTN = 1024
+
+C_GPU = ["\033[38;5;114m", "\033[38;5;213m", "\033[38;5;221m", "\033[38;5;75m"]
+C_HOST = "\033[38;5;81m"
+C_WR = "\033[38;5;33m"
+C_OTH = "\033[38;5;244m"
+C_DIM = "\033[38;5;239m"
+C_BOX = "\033[38;5;245m"
+C_BLD = "\033[1m"
+C_RST = "\033[0m"
+HB = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"]
+VB = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+
+
+# ---------------------------------------------------------------- NVML
+class NVMLError(Exception):
+    pass
+
+
+class _Util(ctypes.Structure):
+    _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
+
+
+class _Mem(ctypes.Structure):
+    _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
+
+
+class _Proc(ctypes.Structure):
+    _fields_ = [("pid", ctypes.c_uint), ("usedGpuMemory", ctypes.c_ulonglong),
+                ("gpuInstanceId", ctypes.c_uint), ("computeInstanceId", ctypes.c_uint)]
+
+
+class _ProcUtil(ctypes.Structure):
+    _fields_ = [("pid", ctypes.c_uint), ("timeStamp", ctypes.c_ulonglong), ("smUtil", ctypes.c_uint),
+                ("memUtil", ctypes.c_uint), ("encUtil", ctypes.c_uint), ("decUtil", ctypes.c_uint)]
+
+
+class NVML:
+    INSUFFICIENT_SIZE = 7
+
+    def __init__(self):
+        self.lib = ctypes.CDLL("libnvidia-ml.so.1")
+        self.call("nvmlInit_v2")
+        n = ctypes.c_uint()
+        self.call("nvmlDeviceGetCount_v2", ctypes.byref(n))
+        self.handles = []
+        for i in range(n.value):
+            h = ctypes.c_void_p()
+            self.call("nvmlDeviceGetHandleByIndex_v2", i, ctypes.byref(h))
+            self.handles.append(h)
+        buf = ctypes.create_string_buffer(96)
+        self.call("nvmlSystemGetDriverVersion", buf, 96)
+        self.driver = buf.value.decode()
+        v = ctypes.c_int()
+        self.cuda = ""
+        if self.try_call("nvmlSystemGetCudaDriverVersion_v2", ctypes.byref(v)):
+            self.cuda = "%d.%d" % (v.value // 1000, v.value % 1000 // 10)
+
+    def call(self, fn, *args):
+        r = getattr(self.lib, fn)(*args)
+        if r:
+            raise NVMLError("%s: %d" % (fn, r))
+
+    def try_call(self, fn, *args):
+        try:
+            return getattr(self.lib, fn)(*args) == 0
+        except AttributeError:
+            return False
+
+    def uint(self, fn, h, *args):
+        v = ctypes.c_uint()
+        return v.value if self.try_call(fn, h, *args, ctypes.byref(v)) else None
+
+    def name(self, h):
+        buf = ctypes.create_string_buffer(96)
+        self.call("nvmlDeviceGetName", h, buf, 96)
+        return buf.value.decode().replace("NVIDIA ", "")
+
+    def peak_gbs(self, h):
+        """Theoretical DRAM GB/s from max memory clock and bus width (DDR: 2 transfers/clock)."""
+        clk = self.uint("nvmlDeviceGetMaxClockInfo", h, 2)
+        bus = self.uint("nvmlDeviceGetMemoryBusWidth", h)
+        return clk * 2 * bus / 8 / 1000 if clk and bus else 0
+
+    def util(self, h):
+        u = _Util()
+        return (u.gpu, u.memory) if self.try_call("nvmlDeviceGetUtilizationRates", h, ctypes.byref(u)) else (0, 0)
+
+    def mem(self, h):
+        m = _Mem()
+        return (m.used, m.total) if self.try_call("nvmlDeviceGetMemoryInfo", h, ctypes.byref(m)) else (0, 0)
+
+    def procs(self, h):
+        """{pid: used VRAM bytes or None} from compute and graphics process lists."""
+        out = {}
+        for fn in ("nvmlDeviceGetComputeRunningProcesses_v3", "nvmlDeviceGetGraphicsRunningProcesses_v3"):
+            n = ctypes.c_uint(0)
+            try:
+                r = getattr(self.lib, fn)(h, ctypes.byref(n), None)
+            except AttributeError:
+                continue
+            if r not in (0, self.INSUFFICIENT_SIZE) or not n.value:
+                continue
+            n.value += 8
+            arr = (_Proc * n.value)()
+            if getattr(self.lib, fn)(h, ctypes.byref(n), arr):
+                continue
+            for p in arr[: n.value]:
+                out[p.pid] = None if p.usedGpuMemory >= 1 << 63 else p.usedGpuMemory
+        return out
+
+    def proc_util(self, h, since_us):
+        """{pid: (sm%, mem%)} averaged over samples newer than since_us."""
+        n = ctypes.c_uint(0)
+        r = self.lib.nvmlDeviceGetProcessUtilization(h, None, ctypes.byref(n), ctypes.c_ulonglong(since_us))
+        if r != self.INSUFFICIENT_SIZE or not n.value:
+            return {}
+        arr = (_ProcUtil * n.value)()
+        if self.lib.nvmlDeviceGetProcessUtilization(h, arr, ctypes.byref(n), ctypes.c_ulonglong(since_us)):
+            return {}
+        acc = {}
+        for s in arr[: n.value]:
+            a = acc.setdefault(s.pid, [0, 0, 0])
+            a[0] += s.smUtil
+            a[1] += s.memUtil
+            a[2] += 1
+        return {pid: (a[0] / a[2], a[1] / a[2]) for pid, a in acc.items()}
+
+
+# ---------------------------------------------------------------- host IMC
+class HostIMC:
+    """Intel uncore IMC CAS counters, summed per socket. Raises OSError without root."""
+
+    BASE = "/sys/bus/event_source/devices"
+
+    def __init__(self):
+        libc = ctypes.CDLL(None, use_errno=True)
+        self.fds = []  # (socket index, "rd"/"wr", fd)
+        self.bytes_per = 64.0
+        pmus = sorted(d for d in os.listdir(self.BASE) if re.match(r"uncore_imc_\d+$", d))
+        if not pmus:
+            raise OSError("no uncore_imc PMUs (not an Intel server CPU?)")
+        self.nsock = 0
+        for d in pmus:
+            p = os.path.join(self.BASE, d)
+            typ = int(open(p + "/type").read())
+            cpus = [int(c) for c in open(p + "/cpumask").read().strip().split(",") if c]
+            self.nsock = max(self.nsock, len(cpus))
+            for kind, ev in (("rd", "cas_count_read"), ("wr", "cas_count_write")):
+                cfg = self._config(p, open("%s/events/%s" % (p, ev)).read().strip())
+                try:
+                    scale = float(open("%s/events/%s.scale" % (p, ev)).read())
+                    unit = open("%s/events/%s.unit" % (p, ev)).read().strip()
+                    self.bytes_per = scale * (1 << 20 if unit == "MiB" else 1)
+                except OSError:
+                    pass
+                for s, cpu in enumerate(cpus):
+                    attr = ctypes.create_string_buffer(struct.pack("IIQ", typ, 64, cfg) + bytes(48), 64)
+                    fd = libc.syscall(ctypes.c_long(298), attr, ctypes.c_int(-1), ctypes.c_int(cpu),
+                                      ctypes.c_int(-1), ctypes.c_ulong(0))
+                    if fd < 0:
+                        e = ctypes.get_errno()
+                        self.close()
+                        raise OSError(e, "perf_event_open: " + os.strerror(e))
+                    self.fds.append((s, kind, fd))
+        self.prev = self._read()
+
+    @staticmethod
+    def _config(pmu, spec):
+        cfg = 0
+        for kv in spec.split(","):
+            k, _, v = kv.partition("=")
+            fmt = open("%s/format/%s" % (pmu, k)).read().strip()  # e.g. "config:8-15"
+            lo = int(fmt.split(":")[1].split("-")[0])
+            cfg |= int(v or "1", 0) << lo
+        return cfg
+
+    def _read(self):
+        return [struct.unpack("Q", os.read(fd, 8))[0] for _, _, fd in self.fds]
+
+    def sample(self, dt):
+        """Per socket [(rd GB/s, wr GB/s)]."""
+        cur = self._read()
+        out = [[0.0, 0.0] for _ in range(self.nsock)]
+        for (s, kind, _), a, b in zip(self.fds, self.prev, cur):
+            out[s][kind == "wr"] += (b - a) * self.bytes_per / dt / 1e9
+        self.prev = cur
+        return out
+
+    def close(self):
+        for _, _, fd in self.fds:
+            os.close(fd)
+        self.fds = []
+
+
+def host_peak_gbs():
+    """Theoretical host DRAM GB/s: sum over populated DIMMs of configured MT/s x 8 bytes (assumes 1 DIMM/channel)."""
+    try:
+        out = subprocess.run(["dmidecode", "-t", "memory"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    speeds = [int(m) for m in re.findall(r"Configured (?:Memory|Clock) Speed: (\d+) MT/s", out)]
+    return sum(speeds) * 8 / 1000
+
+
+# ---------------------------------------------------------------- /proc
+CLK = os.sysconf("SC_CLK_TCK")
+PAGE = os.sysconf("SC_PAGE_SIZE")
+
+
+def cpu_times():
+    v = [int(x) for x in open("/proc/stat").readline().split()[1:]]
+    idle = v[3] + v[4]
+    return sum(v[:8]) - idle, sum(v[:8])
+
+
+def host_mem():
+    m = {}
+    for line in open("/proc/meminfo"):
+        k, v = line.split(":")
+        m[k] = int(v.split()[0]) * 1024
+    return m["MemTotal"] - m["MemAvailable"], m["MemTotal"]
+
+
+def proc_info(pid):
+    """(cpu ticks, rss bytes, user, command) or None if gone."""
+    try:
+        st = open("/proc/%d/stat" % pid).read()
+        f = st[st.rindex(")") + 2:].split()
+        ticks = int(f[11]) + int(f[12])
+        rss = int(f[21]) * PAGE
+        try:
+            user = pwd.getpwuid(os.stat("/proc/%d" % pid).st_uid).pw_name
+        except KeyError:
+            user = str(os.stat("/proc/%d" % pid).st_uid)
+        cmd = open("/proc/%d/cmdline" % pid, "rb").read().replace(b"\0", b" ").decode(errors="replace").strip()
+        return ticks, rss, user, cmd or st[st.index("(") + 1: st.rindex(")")]
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+# ---------------------------------------------------------------- app state
+class App:
+    def __init__(self, interval):
+        self.interval = interval
+        self.nv = NVML()
+        self.gpus = []
+        for i, h in enumerate(self.nv.handles):
+            self.gpus.append({"i": i, "h": h, "name": self.nv.name(h), "peak": self.nv.peak_gbs(h),
+                              "hist": deque(maxlen=HISTN), "max": 0.0})
+        self.host = None
+        self.host_err = ""
+        try:
+            self.host = HostIMC()
+        except OSError as e:
+            self.host_err = "needs root (run with sudo)" if getattr(e, "errno", 0) in (1, 13) else str(e)
+        self.host_peak = host_peak_gbs() if self.host else 0
+        self.host_hist = deque(maxlen=HISTN)
+        self.host_max = 0.0
+        self.host_bw = []
+        self.cpu_prev = cpu_times()
+        self.cpu_util = 0.0
+        self.ncpu = os.cpu_count()
+        self.mem = host_mem()
+        self.ptick = {}
+        self.procs = []
+        self.t_last = time.monotonic()
+        self.have = False
+
+    def sample(self):
+        now = time.monotonic()
+        dt = now - self.t_last
+        self.t_last = now
+        since = int((time.time() - max(dt, 1.0)) * 1e6)
+        rows = []
+        for g in self.gpus:
+            h = g["h"]
+            g["sm"], g["busy"] = self.nv.util(h)
+            g["used"], g["total"] = self.nv.mem(h)
+            g["rx"] = (self.nv.uint("nvmlDeviceGetPcieThroughput", h, 1) or 0) / 1e6
+            g["tx"] = (self.nv.uint("nvmlDeviceGetPcieThroughput", h, 0) or 0) / 1e6
+            g["pw"] = (self.nv.uint("nvmlDeviceGetPowerUsage", h) or 0) / 1000
+            g["pwl"] = (self.nv.uint("nvmlDeviceGetEnforcedPowerLimit", h) or 0) / 1000
+            g["temp"] = self.nv.uint("nvmlDeviceGetTemperature", h, 0)
+            g["mclk"] = self.nv.uint("nvmlDeviceGetClockInfo", h, 2)
+            g["est"] = g["busy"] / 100 * g["peak"] * EFF
+            g["max"] = max(g["max"], g["est"])
+            g["hist"].append(g["est"])
+            util = self.nv.proc_util(h, since)
+            for pid, vram in self.nv.procs(h).items():
+                sm, mu = util.get(pid, (0, 0))
+                rows.append({"pid": pid, "gpu": g["i"], "vram": vram, "sm": sm, "mu": mu})
+        if self.host:
+            self.host_bw = self.host.sample(dt)
+            tot = sum(r + w for r, w in self.host_bw)
+            self.host_max = max(self.host_max, tot)
+            self.host_hist.append(tot)
+        busy, total = cpu_times()
+        db, dtot = busy - self.cpu_prev[0], total - self.cpu_prev[1]
+        self.cpu_util = 100 * db / dtot if dtot else 0
+        self.cpu_prev = (busy, total)
+        self.mem = host_mem()
+        ticks = {}
+        for r in rows:
+            info = proc_info(r["pid"])
+            if not info:
+                r.update(cpu=None, rss=None, user="?", cmd="[%d]" % r["pid"])
+                continue
+            t, r["rss"], r["user"], r["cmd"] = info
+            ticks[r["pid"]] = t
+            p = self.ptick.get(r["pid"])
+            r["cpu"] = (t - p) / CLK / dt * 100 if p is not None and dt > 0 else None
+        self.ptick = ticks
+        rows.sort(key=lambda r: (-r["mu"], -r["sm"], -(r["vram"] or 0)))
+        self.procs = rows
+        self.have = True
+
+    def reset(self):
+        for g in self.gpus:
+            g["max"] = 0.0
+        self.host_max = 0.0
+
+
+# ---------------------------------------------------------------- drawing
+def vlen(s):
+    return len(re.sub(r"\033\[[0-9;?]*[A-Za-z]", "", s))
+
+
+def pct_col(v):
+    return "\033[32m" if v < 50 else "\033[33m" if v < 80 else "\033[31m"
+
+
+def fmt_bytes(v):
+    if v is None:
+        return "-"
+    if v >= 1 << 30:
+        return "%.1fG" % (v / (1 << 30))
+    return "%.0fM" % (v / (1 << 20))
+
+
+class Screen:
+    def __init__(self, w, h):
+        self.w, self.h = w, h
+        self.buf = []
+
+    def p(self, s):
+        self.buf.append(s)
+
+    def at(self, y, x=1):
+        self.p("\033[%d;%dH" % (y, x))
+
+    def row(self, y):
+        self.at(y)
+        self.p("\033[2K" + C_BOX + "│" + C_RST + "\033[%dG" % self.w + C_BOX + "│" + C_RST + "\033[%dG" % 3)
+
+    def top(self, y, title, right=None):
+        self.at(y)
+        rl = len(right) + 2 if right else 0
+        fill = max(0, self.w - 6 - vlen(title) - rl)
+        self.p(C_BOX + "╭─ " + C_RST + C_BLD + title + C_RST + C_BOX + " " + "─" * fill
+               + (" %s " % right if right else "") + "─╮" + C_RST)
+
+    def mid(self, y):
+        self.at(y)
+        self.p(C_BOX + "├" + "─" * (self.w - 2) + "┤" + C_RST)
+
+    def bot(self, y, right=None):
+        self.at(y)
+        rl = len(right) + 2 if right else 0
+        self.p(C_BOX + "╰" + "─" * (self.w - 3 - rl) + (" %s " % right if right else "") + "─╯" + C_RST)
+
+    def bar(self, w, segs, scale):
+        """Stacked horizontal bar; segs = [(value, color)], full width = scale."""
+        tot = sum(v for v, _ in segs)
+        t8 = min(w * 8, int(tot / scale * w * 8 + 0.5)) if scale > 0 else 0
+        out = []
+        for i in range(w):
+            f = min(8, t8 - 8 * i)
+            if f <= 0:
+                out.append(C_DIM + "─")
+                continue
+            pos = (8 * i + f / 2) / (8 * w) * scale
+            cum = 0
+            col = segs[-1][1]
+            for v, c in segs:
+                cum += v
+                if pos <= cum:
+                    col = c
+                    break
+            out.append(col + HB[f])
+        self.p("".join(out) + C_RST)
+
+    def strip(self, y, x, w, h, data, scale, col):
+        """Area chart of the last w values in data, h rows tall, at (y, x)."""
+        vals = list(data)[-w:]
+        vals = [None] * (w - len(vals)) + vals
+        k = 8 * h / scale if scale > 0 else 0
+        for r in range(h):
+            self.at(y + r, x)
+            base = 8 * (h - 1 - r)
+            line = [col]
+            for v in vals:
+                if v is None:
+                    line.append(" ")
+                    continue
+                f = min(8, int(v * k + 0.5) - base)
+                line.append(VB[f] if f > 0 else (C_DIM + "▁" + col if r == h - 1 else " "))
+            self.p("".join(line) + C_RST)
+
+    def flush(self):
+        sys.stdout.buffer.write("".join(self.buf).encode())
+        sys.stdout.buffer.flush()
+        self.buf = []
+
+
+def render(app, w, h):
+    s = Screen(w, h)
+    s.p("\033[H\033[2J")
+    if w < 80 or h < 24:
+        s.p("nvbwtop: terminal too small (%dx%d, need 80x24). q to quit." % (w, h))
+        s.flush()
+        return
+    y = 1
+    title = "nvbwtop · %s · driver %s%s" % (socket.gethostname(), app.nv.driver,
+                                            " · CUDA " + app.nv.cuda if app.nv.cuda else "")
+    s.top(y, title, time.strftime("%H:%M:%S"))
+    y += 1
+    bw = max(10, w - 4 - 11 - 46)
+
+    for gi, g in enumerate(app.gpus):
+        if not app.have:
+            break
+        col = C_GPU[gi % len(C_GPU)]
+        s.row(y)
+        s.p(col + C_BLD + "GPU%-2d" % g["i"] + C_RST + col + " VRAM " + C_RST)
+        s.bar(bw, [(g["est"], col)], g["peak"] * EFF or 1)
+        s.p(" %s%3d%%%s busy  ≈%s%5.0f%s GB/s %sof %.0f   max %.0f%s" % (
+            pct_col(g["busy"]), g["busy"], C_RST, C_BLD, g["est"], C_RST, C_OTH, g["peak"], g["max"], C_RST))
+        y += 1
+        s.row(y)
+        s.p(" " * 5 + C_OTH + " SM   " + C_RST)
+        s.bar(bw, [(g["sm"], pct_col(g["sm"]))], 100)
+        s.p(" %s%3d%%%s       %s%5.1f%s/%.0f GB VRAM used" % (
+            pct_col(g["sm"]), g["sm"], C_RST, C_BLD, g["used"] / (1 << 30), C_RST, g["total"] / (1 << 30)))
+        y += 1
+        s.row(y)
+        s.p(C_OTH + "      %s · PCIe ↓%.2f ↑%.2f GB/s · %.0f/%.0f W · %s°C · mem %s MHz" % (
+            g["name"], g["rx"], g["tx"], g["pw"], g["pwl"], g["temp"] if g["temp"] is not None else "?",
+            g["mclk"] or "?") + C_RST)
+        y += 1
+        s.mid(y)
+        y += 1
+
+    # Host DRAM
+    s.row(y)
+    if app.host and app.host_bw:
+        rd = sum(r for r, _ in app.host_bw)
+        wr = sum(x for _, x in app.host_bw)
+        scale = app.host_peak or max(app.host_max, 50)
+        s.p(C_HOST + C_BLD + "HOST " + C_RST + C_HOST + " DRAM " + C_RST)
+        s.bar(bw, [(rd, C_HOST), (wr, C_WR)], scale)
+        pk = (" %s%3.0f%%%s of %.0f" % (pct_col(100 * (rd + wr) / scale), 100 * (rd + wr) / scale, C_RST,
+                                        app.host_peak)) if app.host_peak else ""
+        s.p("  %s%6.1f%s GB/s%s%s   max %.0f%s" % (C_BLD, rd + wr, C_RST, pk, C_OTH, app.host_max, C_RST))
+        y += 1
+        s.row(y)
+        parts = ["S%d %srd%s %.1f %swr%s %.1f" % (i, C_HOST, C_RST, r, C_WR, C_RST, x)
+                 for i, (r, x) in enumerate(app.host_bw)]
+        s.p("      " + "   ".join(parts))
+    else:
+        s.p(C_HOST + C_BLD + "HOST " + C_RST + C_HOST + " DRAM " + C_RST + C_OTH
+            + (app.host_err or "sampling...") + C_RST)
+    y += 1
+    s.row(y)
+    used, total = app.mem
+    s.p("      CPU %s%3.0f%%%s of %d threads    RAM %.0f/%.0f GB" % (
+        pct_col(app.cpu_util), app.cpu_util, C_RST, app.ncpu, used / (1 << 30), total / (1 << 30)))
+    y += 1
+    s.bot(y)
+    y += 1
+
+    # History strips: one per GPU plus host, each scaled to its own peak
+    series = [("GPU%d" % g["i"], g["hist"], g["peak"] * EFF or 1, C_GPU[i % len(C_GPU)])
+              for i, g in enumerate(app.gpus)]
+    if app.host:
+        series.append(("HOST", app.host_hist, app.host_peak or max(app.host_max, 50), C_HOST))
+    room = h - y - 2 - 4  # keep at least a few process rows
+    sh = max(2, min(5, (room // 2) // max(1, len(series))))
+    gw = w - 10
+    s.top(y, "bandwidth history " + C_RST + C_OTH + "(GB/s, each scaled to its peak)")
+    y += 1
+    for name, data, scale, col in series:
+        for r in range(sh):
+            s.row(y + r)
+            s.at(y + r, 3)
+            if r == 0:
+                s.p(col + "%-5s" % name + C_RST + C_OTH + "%3s" % "" + C_RST)
+            elif r == sh - 1:
+                s.p(C_OTH + "%5.0f" % scale + C_RST)
+        s.strip(y, 9, gw, sh, data, scale, col)
+        y += sh
+    s.bot(y, "%.0fs" % (gw * app.interval))
+    y += 1
+
+    # Processes
+    s.at(y)
+    hdr = "%7s %-10s %3s %5s %5s %7s %6s %7s  %s" % ("PID", "USER", "GPU", "SM%", "MEM%", "VRAM", "CPU%", "RSS",
+                                                   "COMMAND")
+    s.p("\033[7m" + hdr.ljust(w)[:w] + C_RST)
+    y += 1
+    for r in app.procs:
+        if y >= h:
+            break
+        s.at(y)
+        col = C_GPU[r["gpu"] % len(C_GPU)]
+        cpu = "-" if r["cpu"] is None else "%.1f" % r["cpu"]
+        line = "%7d %-10.10s %s%3d%s %s%5.0f%s %s%5.0f%s %7s %6s %7s  " % (
+            r["pid"], r["user"], col, r["gpu"], C_RST, pct_col(r["sm"]), r["sm"], C_RST,
+            pct_col(r["mu"]), r["mu"], C_RST, fmt_bytes(r["vram"]), cpu, fmt_bytes(r["rss"]))
+        s.p(line + r["cmd"][: max(0, w - vlen(line))])
+        y += 1
+    if not app.procs and app.have:
+        s.at(y)
+        s.p(C_OTH + "  no GPU processes" + C_RST)
+
+    s.at(h)
+    s.p("\033[7m q \033[0m quit  \033[7m +/- \033[0m interval %.2gs  \033[7m r \033[0m reset max" % app.interval)
+    if w >= 110:
+        s.p(C_OTH + "   GPU GB/s ≈ estimated from NVML busy%; host GB/s measured (IMC)" + C_RST)
+    s.flush()
+
+
+# ---------------------------------------------------------------- main
+def term_size():
+    try:
+        sz = os.get_terminal_size(1)
+        return sz.columns, sz.lines
+    except OSError:
+        return int(os.environ.get("COLUMNS", 110)), int(os.environ.get("LINES", 45))
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="Live GPU VRAM and host DRAM bandwidth monitor.")
+    ap.add_argument("-i", type=float, default=1.0, help="update interval in seconds (default 1)")
+    ap.add_argument("--host-peak", type=float, help="override host DRAM peak GB/s")
+    ap.add_argument("-1", dest="once", action="store_true", help="print one frame and exit")
+    a = ap.parse_args()
+    app = App(max(0.25, a.i))
+    if a.host_peak:
+        app.host_peak = a.host_peak
+
+    if a.once:
+        for _ in range(2):
+            time.sleep(app.interval)
+            app.sample()
+        w, h = term_size()
+        render(app, w, h - 1)  # leave room for the trailing newline
+        sys.stdout.write("\n")
+        return
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        sys.exit("nvbwtop: needs a terminal (use -1 for a snapshot)")
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    state = {"resized": False}
+    signal.signal(signal.SIGWINCH, lambda *_: state.update(resized=True))
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    try:
+        tty.setcbreak(fd)
+        sys.stdout.write("\033[?1049h\033[?25l")
+        render(app, *term_size())
+        while True:
+            remain = app.interval - (time.monotonic() - app.t_last)
+            if remain <= 0:
+                app.sample()
+                render(app, *term_size())
+                continue
+            try:
+                r, _, _ = select.select([fd], [], [], remain)
+            except InterruptedError:
+                r = []
+            if state["resized"]:
+                state["resized"] = False
+                render(app, *term_size())
+            if not r:
+                continue
+            c = os.read(fd, 32).decode(errors="ignore")
+            if "q" in c or "Q" in c:
+                break
+            if "+" in c or "=" in c:
+                app.interval = min(5.0, app.interval * 2)
+            if "-" in c or "_" in c:
+                app.interval = max(0.25, app.interval / 2)
+            if "r" in c or "R" in c:
+                app.reset()
+            render(app, *term_size())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\033[?25h\033[?1049l")
+        sys.stdout.flush()
+        if app.host:
+            app.host.close()
+
+
+if __name__ == "__main__":
+    main()

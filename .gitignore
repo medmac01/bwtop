@@ -1,0 +1,7 @@
+macos/mbtop
+macos/membw
+bench/rdbench
+bench/metalbench
+bench/cudabench
+__pycache__/
+.DS_Store
